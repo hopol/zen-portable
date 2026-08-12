@@ -47,7 +47,9 @@ jobs:
           if [[ -n "${INPUT}" ]]; then
             TAG="${INPUT}"
           else
-            TAG=$(curl -sS -H "Accept: application/vnd.github+json" \
+            TAG=$(curl -sS \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ github.token }}" \
               "https://api.github.com/repos/${ZEN_UPSTREAM}/releases/latest" \
               | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
           fi
@@ -99,6 +101,7 @@ jobs:
 
           DMG_URL=$(curl -sSL --retry 3 --retry-delay 5 \
             -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ github.token }}" \
             "https://api.github.com/repos/${ZEN_UPSTREAM}/releases/tags/${TAG}" \
             | python3 /tmp/find_dmg.py)
           if [[ -z "${DMG_URL}" ]]; then
@@ -225,7 +228,7 @@ jobs:
           $out = ".\download"
           New-Item -ItemType Directory -Force -Path $out, ".\dist" | Out-Null
           $resp = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ env.ZEN_UPSTREAM }}/releases/tags/$tag" `
-            -Headers @{ "Accept" = "application/vnd.github+json" }
+            -Headers @{ "Accept" = "application/vnd.github+json"; "Authorization" = "Bearer ${{ github.token }}" }
           if ($resp -is [System.Array]) { $resp = $resp[0] }
           $exName = if ("${{ matrix.variant }}" -eq "arm64") { "zen.installer-arm64.exe" } else { "zen.installer.exe" }
           $asset = $resp.assets | Where-Object { $_.name -eq $exName }
@@ -385,12 +388,14 @@ jobs:
 
           URL=$(curl -sSL --retry 3 --retry-delay 5 \
             -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ github.token }}" \
             "https://api.github.com/repos/${ZEN_UPSTREAM}/releases/tags/${TAG}" \
             | python3 /tmp/find_asset.py)
           if [[ -z "${URL}" ]]; then
             echo "ERROR: no asset ${NAME} for tag ${TAG}" >&2
             curl -sSL --retry 3 --retry-delay 5 \
               -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ github.token }}" \
               "https://api.github.com/repos/${ZEN_UPSTREAM}/releases/tags/${TAG}" \
               | python3 -c "import sys,json; r=json.load(sys.stdin); print('Assets:'); [print(' ',a['name']) for a in r.get('assets',[])]"
             exit 1
