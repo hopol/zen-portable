@@ -1,0 +1,488 @@
+# =============================================================================
+# portable-release.yml — Zen Browser 绿色便携版
+# =============================================================================
+# 职责：
+#   1. 从 https://github.com/zen-browser/desktop/releases
+#      下载上游预构建 Release 包
+#   2. 重新封装为绿色便携版（加 .portable 标记 + 便携启动器）
+#   3. 发布到本仓库 GitHub Release
+#
+# 触发：手动 / 定时（每周一 08:00 UTC）
+# =============================================================================
+name: Portable Release
+
+on:
+  schedule:
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "上游 Zen Browser tag（如 1.21.13b，留空取最新）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: portable-release
+  cancel-in-progress: false
+
+env:
+  ZEN_UPSTREAM: "zen-browser/desktop"
+
+jobs:
+  prepare:
+    name: Resolve upstream
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+    steps:
+      - id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          INPUT="${{ github.event.inputs.upstream_tag || '' }}"
+          if [[ -n "${INPUT}" ]]; then
+            TAG="${INPUT}"
+          else
+            TAG=$(curl -sS -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${ZEN_UPSTREAM}/releases/latest" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+          fi
+          if echo "${TAG}" | grep -qiE "alpha|beta|b\.[0-9]|a\.[0-9]"; then
+            PRE="true"
+          else
+            PRE="false"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${PRE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved: ${TAG} (prerelease=${PRE})"
+
+  build-macos:
+    name: Portable macOS
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.prepare.outputs.tag }}"
+          mkdir -p download dist
+
+          cat > /tmp/find_dmg.py << 'PYEOF'
+          import sys, json
+          r = json.load(sys.stdin)
+          if isinstance(r, list):
+              r = r[0]
+          if isinstance(r, dict) and 'message' in r:
+              print("API ERROR: " + r.get('message', 'unknown'), file=sys.stderr)
+              sys.exit(1)
+          assets = r.get('assets', [])
+          if not assets:
+              print("No assets found. Keys: " + str(list(r.keys())), file=sys.stderr)
+              sys.exit(1)
+          for a in assets:
+              n = a['name']
+              if n.endswith('.dmg') and ('universal' in n or 'macos' in n):
+                  print(a['browser_download_url'])
+                  sys.exit(0)
+          print("No matching DMG. Available:")
+          for a in assets:
+              print("  " + a['name'])
+          sys.exit(1)
+          PYEOF
+
+          DMG_URL=$(curl -sSL --retry 3 --retry-delay 5 \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${ZEN_UPSTREAM}/releases/tags/${TAG}" \
+            | python3 /tmp/find_dmg.py)
+          if [[ -z "${DMG_URL}" ]]; then
+            echo "ERROR: no DMG found for tag ${TAG}" >&2
+            exit 1
+          fi
+          echo "Downloading: ${DMG_URL}"
+          curl -fSL --retry 3 --retry-delay 5 -o download/zen.dmg "${DMG_URL}"
+
+      - name: Extract and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          STG=".staging"; mkdir -p "${STG}"
+          MOUNT="/tmp/zen-dmg"; rm -rf "${MOUNT}"
+
+          hdiutil attach download/zen.dmg -mountpoint "${MOUNT}" -nobrowse -quiet
+
+          # Find any .app in DMG (handles Zen.app, Twilight.app, etc.)
+          APP=$(find "${MOUNT}" -maxdepth 2 -name "*.app" -type d 2>/dev/null | head -1)
+          if [[ -z "${APP}" ]]; then
+            echo "ERROR: No .app found in DMG"
+            find "${MOUNT}" -maxdepth 3 2>/dev/null | head -30
+            hdiutil detach "${MOUNT}" -quiet || true
+            exit 1
+          fi
+          APP_NAME=$(basename "${APP}" .app)
+          echo "Found app: ${APP_NAME}.app"
+
+          cp -R "${APP}" "${STG}/"
+          hdiutil detach "${MOUNT}" -quiet || true
+
+          # Write launcher (python avoids heredoc YAML conflicts)
+          python3 << 'PYEOF'
+          import os, sys, stat
+          s = ".staging"
+          # Detect actual .app bundle
+          app_dir = None
+          for d in os.listdir(s):
+              if d.endswith(".app") and os.path.isdir(os.path.join(s, d)):
+                  app_dir = d
+                  break
+          if not app_dir:
+              print("ERROR: No .app found in staging", file=sys.stderr)
+              sys.exit(1)
+          app_name = app_dir[:-4]  # strip .app
+          print("Detected app: " + app_dir)
+
+          # Find actual executable inside Contents/MacOS/
+          macos_dir = os.path.join(s, app_dir, "Contents", "MacOS")
+          exe_name = None
+          for f in os.listdir(macos_dir):
+              fp = os.path.join(macos_dir, f)
+              if os.path.isfile(fp) and os.access(fp, os.X_OK):
+                  exe_name = f
+                  break
+          if not exe_name:
+              # Fallback: try app_name lowercased
+              exe_name = app_name.lower()
+          print("Executable: " + exe_name)
+
+          launcher = (
+              "#!/bin/bash\n"
+              'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+              'export MOZILLA_PROFILE="${SCRIPT_DIR}/zen-portable-data"\n'
+              'export MOZILLA_FIVE_HOME="${SCRIPT_DIR}/' + app_dir + '/Contents/MacOS"\n'
+              'mkdir -p "${MOZILLA_PROFILE}"\n'
+              'exec "${SCRIPT_DIR}/' + app_dir + '/Contents/MacOS/' + exe_name + '" --profile "${MOZILLA_PROFILE}" "$@"\n'
+          )
+          open(os.path.join(s, "zen-portable.command"), "w").write(launcher)
+          os.chmod(os.path.join(s, "zen-portable.command"), 0o755)
+          open(os.path.join(s, "README.txt"), "w").write(
+              "Zen Browser Portable (macOS)\n"
+              "Double-click zen-portable.command to run.\n"
+              "All data stored in zen-portable-data/ next to the app.\n"
+              "No changes to ~/Library or system directories.\n"
+              "To migrate: copy the entire directory.\n"
+          )
+          open(os.path.join(s, ".portable"), "w").close()
+          PYEOF
+
+          OUTFILE="$(pwd)/dist/zen-browser-portable-macos-${{ needs.prepare.outputs.tag }}.zip"
+          cd "${STG}"
+          zip -r "${OUTFILE}" .
+          cd ..; rm -rf "${STG}"
+          ls -lh dist/
+
+      - name: Checksum
+        shell: bash
+        run: cd dist && shasum -a 256 * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-macos
+          path: dist/
+          if-no-files-found: error
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        if: always()
+        with:
+          files: dist/*
+          tag_name: portable-${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.is_prerelease }}
+          name: Zen Portable ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
+
+  build-windows:
+    name: Portable Windows (${{ matrix.variant }})
+    needs: prepare
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        variant: [x64, arm64]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download installer
+        shell: powershell
+        run: |
+          $tag = "${{ needs.prepare.outputs.tag }}"
+          $out = ".\download"
+          New-Item -ItemType Directory -Force -Path $out, ".\dist" | Out-Null
+          $resp = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ env.ZEN_UPSTREAM }}/releases/tags/$tag" `
+            -Headers @{ "Accept" = "application/vnd.github+json" }
+          if ($resp -is [System.Array]) { $resp = $resp[0] }
+          $exName = if ("${{ matrix.variant }}" -eq "arm64") { "zen.installer-arm64.exe" } else { "zen.installer.exe" }
+          $asset = $resp.assets | Where-Object { $_.name -eq $exName }
+          if (-not $asset) { throw "No asset: $exName (tag=$tag)" }
+          Write-Host "Downloading: $($asset.browser_download_url)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "$out\zen.exe" -UseBasicParsing
+          Write-Host "Done: $((Get-Item "$out\zen.exe").Length) bytes"
+
+      - name: Extract and package
+        shell: powershell
+        run: |
+          $tag = "${{ needs.prepare.outputs.tag }}"
+          $dl = ".\download"; $stg = ".\.staging"; $out = ".\dist"
+          Remove-Item -Recurse -Force $stg -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stg | Out-Null
+
+          # Extract NSIS installer with 7-zip
+          $xDir = "$stg\x"; New-Item -ItemType Directory -Force -Path $xDir | Out-Null
+          Write-Host "Extracting installer..."
+          & "C:\Program Files\7-Zip\7z.exe" x "$dl\zen.exe" -o"$xDir" -y
+
+          # Find zen.exe and copy its PARENT directory contents to staging root
+          $zenExe = Get-ChildItem $xDir -Recurse -Filter "zen.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $zenExe) {
+              Write-Host "Files after extraction:"
+              Get-ChildItem $xDir -Recurse -Name | Select-Object -First 30
+              throw "zen.exe not found after extraction"
+          }
+          Write-Host "Found zen.exe at: $($zenExe.FullName)"
+          $browserDir = $zenExe.DirectoryName
+          Write-Host "Browser directory: $browserDir"
+          # Copy CONTENTS of browser directory to staging root (flatten nesting)
+          Get-ChildItem "$browserDir\*" -Force | Copy-Item -Destination $stg -Recurse -Force
+          # Clean up extraction directory
+          Remove-Item -Recurse -Force $xDir -ErrorAction SilentlyContinue
+
+          # Verify zen.exe is now at staging root
+          $stgExe = Join-Path $stg "zen.exe"
+          if (-not (Test-Path $stgExe)) {
+              Write-Host "Files in staging:"
+              Get-ChildItem $stg -Name | Select-Object -First 30
+              throw "zen.exe not found at staging root after copy"
+          }
+          Write-Host "zen.exe verified at staging root"
+
+          # Portable launcher (bat) - write all at once with consistent UTF-8 encoding
+          $batPath = Join-Path $stg "zen-portable.bat"
+          $batLines = @(
+              '@echo off'
+              'setlocal'
+              'set "SCRIPT_DIR=%~dp0"'
+              'set "ZEN_DATA=%SCRIPT_DIR%zen-portable-data"'
+              'if not exist "%ZEN_DATA%" mkdir "%ZEN_DATA%"'
+              'set "MOZILLA_PROFILE=%ZEN_DATA%"'
+              'set "MOZILLA_FIVE_HOME=%SCRIPT_DIR%"'
+              'set "MOZ_NO_REMOTE=1"'
+              '"%SCRIPT_DIR%zen.exe" --profile "%ZEN_DATA%" %*'
+              'endlocal'
+          )
+          $batContent = $batLines -join "`r`n"
+          [System.IO.File]::WriteAllText($batPath, $batContent, (New-Object System.Text.UTF8Encoding($false)))
+          Copy-Item "$stg\zen-portable.bat" "$stg\zen-portable.cmd" -Force
+
+          # README
+          $rmPath = Join-Path $stg "README.txt"
+          $rmContent = @(
+              'Zen Browser Portable (Windows)'
+              'Extract and double-click zen-portable.bat to run.'
+              'All data stored in zen-portable-data/ next to the exe.'
+              'No registry changes, no AppData writes.'
+              'To migrate: copy the entire directory to a new location.'
+          ) -join "`r`n"
+          [System.IO.File]::WriteAllText($rmPath, $rmContent, (New-Object System.Text.UTF8Encoding($false)))
+
+          New-Item -ItemType File -Force -Path "$stg\.portable" | Out-Null
+
+          $arch = if ("${{ matrix.variant }}" -eq "arm64") { "arm64" } else { "amd64" }
+          $f = "$out\zen-browser-portable-windows-$arch-$tag.zip"
+          Compress-Archive -Path (Join-Path $stg "*") -DestinationPath $f -Force
+          Remove-Item -Recurse -Force $stg
+          Get-ChildItem $out | Format-Table Name,Length -AutoSize
+
+      - name: Checksum
+        shell: powershell
+        run: |
+          Push-Location .\dist
+          $h = Get-ChildItem -File | Where-Object { $_.Name -ne "SHA256SUMS" } | ForEach-Object {
+              $c = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+              "$c  $($_.Name)" }
+          $h | Out-File "SHA256SUMS" -Encoding ASCII
+          Get-Content "SHA256SUMS"
+          Pop-Location
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-win-${{ matrix.variant }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        if: always()
+        with:
+          files: dist/*
+          tag_name: portable-${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.is_prerelease }}
+          name: Zen Portable ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
+
+  build-linux:
+    name: Portable Linux (${{ matrix.arch }})
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.prepare.outputs.tag }}"
+          ARCH="${{ matrix.arch }}"
+          mkdir -p download dist
+          if [[ "${ARCH}" == "arm64" ]]; then
+            NAME="zen.linux-aarch64.tar.xz"
+          else
+            NAME="zen.linux-x86_64.tar.xz"
+          fi
+
+          cat > /tmp/find_asset.py << 'PYEOF'
+          import sys, json
+          r = json.load(sys.stdin)
+          if isinstance(r, list):
+              r = r[0]
+          if isinstance(r, dict) and 'message' in r:
+              print("API ERROR: " + r.get('message', 'unknown'), file=sys.stderr)
+              sys.exit(1)
+          assets = r.get('assets', [])
+          if not assets:
+              print("No assets found. Keys: " + str(list(r.keys())), file=sys.stderr)
+              sys.exit(1)
+          for a in assets:
+              n = a['name']
+              if n.endswith('.tar.xz') and 'linux' in n:
+                  print(a['browser_download_url'])
+                  sys.exit(0)
+          print("No matching tar.xz. Available:")
+          for a in assets:
+              print("  " + a['name'])
+          sys.exit(1)
+          PYEOF
+
+          URL=$(curl -sSL --retry 3 --retry-delay 5 \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${ZEN_UPSTREAM}/releases/tags/${TAG}" \
+            | python3 /tmp/find_asset.py)
+          if [[ -z "${URL}" ]]; then
+            echo "ERROR: no asset ${NAME} for tag ${TAG}" >&2
+            curl -sSL --retry 3 --retry-delay 5 \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${ZEN_UPSTREAM}/releases/tags/${TAG}" \
+              | python3 -c "import sys,json; r=json.load(sys.stdin); print('Assets:'); [print(' ',a['name']) for a in r.get('assets',[])]"
+            exit 1
+          fi
+          echo "Downloading: ${NAME}"
+          curl -fSL --retry 3 --retry-delay 5 -o download/zen.tar.xz "${URL}"
+
+      - name: Extract and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          STG=".staging"; rm -rf "${STG}"; mkdir -p "${STG}"
+          mkdir -p download/extracted
+          tar xJf download/zen.tar.xz -C download/extracted
+
+          # Find the top-level directory inside the tarball (e.g. "zen/")
+          # and copy its CONTENTS (not the directory itself) to staging root
+          TOPDIR=$(find download/extracted -mindepth 1 -maxdepth 1 -type d | head -1)
+          if [[ -n "${TOPDIR}" ]]; then
+            echo "Found top-level dir: ${TOPDIR}"
+            cp -a "${TOPDIR}/"* "${STG}/"
+            cp -a "${TOPDIR}"/.* "${STG}/" 2>/dev/null || true
+          else
+            echo "No top-level dir, copying extracted files directly"
+            cp -a download/extracted/* "${STG}/"
+          fi
+
+          # Verify zen binary exists
+          BIN=$(find "${STG}" -maxdepth 3 -name "zen" -type f 2>/dev/null | head -1)
+          if [[ -n "${BIN}" ]]; then
+            chmod 755 "${BIN}"
+            echo "Found zen binary: ${BIN}"
+          else
+            echo "WARNING: zen binary not found at expected path"
+            echo "Staging contents:"
+            ls -la "${STG}/"
+          fi
+
+          python3 << 'PYEOF'
+          import os
+          s = ".staging"
+          launcher = (
+              "#!/bin/bash\n"
+              'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+              'export MOZILLA_PROFILE="${SCRIPT_DIR}/zen-portable-data"\n'
+              'export MOZILLA_FIVE_HOME="${SCRIPT_DIR}"\n'
+              'export MOZ_NO_REMOTE=1\n'
+              'mkdir -p "${MOZILLA_PROFILE}"\n'
+              'BIN="${SCRIPT_DIR}/zen"\n'
+              'if [[ ! -x "${BIN}" ]]; then\n'
+              '    BIN=$(find "${SCRIPT_DIR}" -maxdepth 3 -name "zen" -type f -executable 2>/dev/null | head -1)\n'
+              'fi\n'
+              'if [[ -z "${BIN}" || ! -x "${BIN}" ]]; then\n'
+              '    echo "Error: zen binary not found" >&2; exit 1\n'
+              'fi\n'
+              'exec "${BIN}" --profile "${MOZILLA_PROFILE}" "$@"\n'
+          )
+          open(os.path.join(s, "zen-portable.sh"), "w").write(launcher)
+          os.chmod(os.path.join(s, "zen-portable.sh"), 0o755)
+          open(os.path.join(s, "README.txt"), "w").write(
+              "Zen Browser Portable (Linux)\n"
+              "Run: ./zen-portable.sh\n"
+              "All data stored in zen-portable-data/ next to the binary.\n"
+              "No writes to ~/.mozilla or system directories.\n"
+              "To migrate: copy the entire directory.\n"
+          )
+          open(os.path.join(s, ".portable"), "w").close()
+          PYEOF
+
+          OUTFILE="$(pwd)/dist/zen-browser-portable-linux-${{ matrix.arch }}-${{ needs.prepare.outputs.tag }}.tar.gz"
+          cd "${STG}"
+          tar czf "${OUTFILE}" .
+          cd ..; rm -rf "${STG}"
+          ls -lh dist/
+
+      - name: Checksum
+        shell: bash
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-linux-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        if: always()
+        with:
+          files: dist/*
+          tag_name: portable-${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.is_prerelease }}
+          name: Zen Portable ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
